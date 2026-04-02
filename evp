@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""
+evp - EVIL pAnager (package + manager)
+A sane wrapper around Gentoo's emerge that behaves like a normal package manager
+"""
+
+import sys
+import subprocess
+import argparse
+
+
+def run_emerge(args, dry_run=False):
+    """Execute emerge command with given arguments"""
+    cmd = ["emerge"] + args
+    if dry_run:
+        print(f"Would run: {' '.join(cmd)}")
+        return 0
+    print(f"Running: {' '.join(cmd)}")
+    return subprocess.call(cmd)
+
+
+def install(packages, verbose=False):
+    """Install packages"""
+    args = packages if verbose else ["-q"] + packages
+    return run_emerge(args)
+
+
+def remove(packages, verbose=False):
+    """Safely remove packages (deselect + depclean)"""
+    # First deselect from world
+    args = ["--deselect"] + packages
+    if not verbose:
+        args.insert(0, "-q")
+    
+    print(f"Deselecting {', '.join(packages)} from world...")
+    ret = run_emerge(args)
+    if ret != 0:
+        return ret
+    
+    # Then depclean
+    print("Running depclean to remove orphaned packages...")
+    depclean_args = ["--depclean"] + (["-q"] if not verbose else [])
+    return run_emerge(depclean_args)
+
+
+def brutally_maul(packages, verbose=False):
+    """Forcefully unmerge packages (emerge -C)"""
+    print("⚠️  WARNING: Forceful removal ignores dependencies!")
+    response = input(f"Really brutally maul {', '.join(packages)}? [y/N] ")
+    if response.lower() != 'y':
+        print("Aborted.")
+        return 1
+    
+    args = ["-C"] + packages
+    if not verbose:
+        args.insert(0, "-q")
+    return run_emerge(args)
+
+
+def update(verbose=False):
+    """Update repository metadata (sync)"""
+    args = ["--sync"]
+    if not verbose:
+        args.insert(0, "-q")
+    return run_emerge(args)
+
+
+def upgrade(verbose=False):
+    """Upgrade all packages"""
+    # -u = update, -D = deep, -N = newuse
+    args = ["-uDN", "@world"]
+    if not verbose:
+        args.insert(0, "-q")
+    return run_emerge(args)
+
+
+def search(term, verbose=False):
+    """Search for packages"""
+    args = ["-s", term]
+    return run_emerge(args)
+
+
+def list_installed(verbose=False):
+    """List installed packages"""
+    # Use qlist from portage-utils (should be installed)
+    try:
+        cmd = ["qlist", "-I"]
+        if verbose:
+            cmd.append("-v")
+        return subprocess.call(cmd)
+    except FileNotFoundError:
+        print("Error: qlist not found. Install app-portage/portage-utils")
+        return 1
+
+
+def info(packages, verbose=False):
+    """Show package information"""
+    args = ["-pv"] + packages
+    return run_emerge(args)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="evp - EVIL pAnager: A sane emerge wrapper",
+        epilog="Examples:\n"
+               "  evp install firefox\n"
+               "  evp remove vim\n"
+               "  evp brutally-maul firefox  # force remove\n"
+               "  evp update                 # sync repos\n"
+               "  evp upgrade                # update all packages\n"
+               "  evp search python\n"
+               "  evp list\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument("-v", "--verbose", action="store_true",
+                       help="Verbose output (don't use -q)")
+    
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+    
+    # install
+    install_parser = subparsers.add_parser("install", aliases=["i"],
+                                          help="Install packages")
+    install_parser.add_argument("packages", nargs="+", help="Packages to install")
+    
+    # remove
+    remove_parser = subparsers.add_parser("remove", aliases=["r", "rm"],
+                                         help="Remove packages (safe)")
+    remove_parser.add_argument("packages", nargs="+", help="Packages to remove")
+    
+    # brutally-maul
+    maul_parser = subparsers.add_parser("brutally-maul", aliases=["yeet", "obliterate"],
+                                       help="Force remove packages (emerge -C)")
+    maul_parser.add_argument("packages", nargs="+", help="Packages to brutally maul")
+    
+    # update
+    subparsers.add_parser("update", aliases=["sync"],
+                         help="Update repository metadata")
+    
+    # upgrade
+    subparsers.add_parser("upgrade", aliases=["up"],
+                         help="Upgrade all packages")
+    
+    # search
+    search_parser = subparsers.add_parser("search", aliases=["s"],
+                                         help="Search for packages")
+    search_parser.add_argument("term", help="Search term")
+    
+    # list
+    subparsers.add_parser("list", aliases=["ls"],
+                         help="List installed packages")
+    
+    # info
+    info_parser = subparsers.add_parser("info",
+                                       help="Show package information")
+    info_parser.add_argument("packages", nargs="+", help="Packages to query")
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        return 1
+    
+    # Route to appropriate function
+    verbose = args.verbose
+    
+    if args.command in ["install", "i"]:
+        return install(args.packages, verbose)
+    elif args.command in ["remove", "r", "rm"]:
+        return remove(args.packages, verbose)
+    elif args.command in ["brutally-maul", "yeet", "obliterate"]:
+        return brutally_maul(args.packages, verbose)
+    elif args.command in ["update", "sync"]:
+        return update(verbose)
+    elif args.command in ["upgrade", "up"]:
+        return upgrade(verbose)
+    elif args.command in ["search", "s"]:
+        return search(args.term, verbose)
+    elif args.command in ["list", "ls"]:
+        return list_installed(verbose)
+    elif args.command == "info":
+        return info(args.packages, verbose)
+    else:
+        print(f"Unknown command: {args.command}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
