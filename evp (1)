@@ -1,0 +1,630 @@
+#!/usr/bin/env python3
+"""
+evp - EVIL pAnager (package + manager)
+A sane wrapper around Gentoo's emerge that behaves like a normal package manager
+"""
+
+import sys
+import subprocess
+import os
+import time
+import threading
+from pathlib import Path
+
+# ============================================================================
+# SPINNERS - Edit these to your heart's content!
+# ============================================================================
+SPINNERS = {
+    'dots': ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'],
+    'gentoo': ['c', 'o', 'm', 'p', 'i', 'l', 'i', 'n', 'g', '.', '.', '.'],
+    'penguin': ['🐧   ', ' 🐧  ', '  🐧 ', '   🐧', '  🐧 ', ' 🐧  '],
+    'fire': ['🔥   ', ' 💥  ', '  ✨ ', '   ⚡', '  ✨ ', ' 💥  '],
+    'blocks': ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█', '▇', '▆', '▅', '▄', '▃', '▂'],
+    'arrow': ['←', '↖', '↑', '↗', '→', '↘', '↓', '↙'],
+}
+
+# Pick your favorite!
+ACTIVE_SPINNER = 'gentoo'
+
+# ============================================================================
+# Portage paths
+# ============================================================================
+MAKE_CONF = "/etc/portage/make.conf"
+PACKAGE_USE = "/etc/portage/package.use"
+PACKAGE_KEYWORDS = "/etc/portage/package.accept_keywords"
+PACKAGE_LICENSE = "/etc/portage/package.license"
+REPOS_CONF = "/etc/portage/repos.conf"
+BUILD_LOG_DIR = "/var/tmp/portage"
+
+# ============================================================================
+# Global flags
+# ============================================================================
+DRY_RUN = False
+
+# ============================================================================
+# Spinner utility
+# ============================================================================
+class Spinner:
+    def __init__(self, message="Working"):
+        self.spinner = SPINNERS[ACTIVE_SPINNER]
+        self.message = message
+        self.running = False
+        self.thread = None
+    
+    def _spin(self):
+        idx = 0
+        while self.running:
+            sys.stdout.write(f"\r{self.message} {self.spinner[idx % len(self.spinner)]}")
+            sys.stdout.flush()
+            idx += 1
+            time.sleep(0.1)
+        sys.stdout.write("\r" + " " * (len(self.message) + 10) + "\r")
+        sys.stdout.flush()
+    
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._spin)
+        self.thread.start()
+    
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join()
+
+# ============================================================================
+# Utilities
+# ============================================================================
+def run_command(cmd, explain=True, spinner_msg=None):
+    """Run a command with optional spinner and explanation"""
+    if explain:
+        print(f"→ Running: {' '.join(cmd) if isinstance(cmd, list) else cmd}")
+    
+    if DRY_RUN:
+        print("  (dry-run, not actually running)")
+        return 0
+    
+    if spinner_msg:
+        spinner = Spinner(spinner_msg)
+        spinner.start()
+        ret = subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        spinner.stop()
+        return ret
+    else:
+        return subprocess.call(cmd)
+
+
+def ensure_file_exists(path):
+    """Ensure a file exists, create if it doesn't"""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    if not Path(path).exists():
+        Path(path).touch()
+
+
+def append_to_file(path, content):
+    """Append content to a file"""
+    ensure_file_exists(path)
+    with open(path, 'a') as f:
+        f.write(content + '\n')
+
+
+def remove_from_file(path, pattern):
+    """Remove lines containing pattern from file"""
+    if not Path(path).exists():
+        return
+    
+    with open(path, 'r') as f:
+        lines = f.readlines()
+    
+    with open(path, 'w') as f:
+        for line in lines:
+            if pattern not in line:
+                f.write(line)
+
+
+# ============================================================================
+# Package operations
+# ============================================================================
+def install(packages):
+    """Install packages"""
+    if not packages:
+        print("Usage: evp install <package> [package...]")
+        return 1
+    return run_command(["emerge"] + packages, explain=True)
+
+
+def remove(packages, force=False):
+    """Remove packages (safely by default, forcefully with -f)"""
+    if not packages:
+        print("Usage: evp remove [-f] <package> [package...]")
+        return 1
+    
+    if force:
+        print("⚠ Force removing (--unmerge) - this ignores dependencies!")
+        return run_command(["emerge", "-C"] + packages, explain=True)
+    else:
+        print("→ Deselecting packages from world...")
+        ret = run_command(["emerge", "--deselect"] + packages, explain=True)
+        if ret != 0:
+            return ret
+        
+        print("\n→ Cleaning orphaned packages...")
+        return run_command(["emerge", "--depclean", "-a"], explain=True)
+
+
+def update():
+    """Update repository metadata"""
+    print("→ Syncing repositories...")
+    return run_command(["emerge", "--sync"], explain=True, spinner_msg="Syncing repos")
+
+
+def upgrade():
+    """Upgrade installed packages"""
+    print("→ Upgrading system packages...")
+    return run_command(["emerge", "-uDN", "@world", "-a"], explain=True)
+
+
+def search(term):
+    """Search for packages"""
+    if not term:
+        print("Usage: evp search <term>")
+        return 1
+    return run_command(["emerge", "-s", term[0]])
+
+
+def list_installed():
+    """List installed packages"""
+    if subprocess.call(["which", "qlist"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+        return subprocess.call(["qlist", "-I"])
+    else:
+        return run_command(["emerge", "@world", "-p"])
+
+
+def info(packages):
+    """Show package information"""
+    if not packages:
+        print("Usage: evp info <package>")
+        return 1
+    return run_command(["emerge", "-pv"] + packages)
+
+
+# ============================================================================
+# USE flag management
+# ============================================================================
+def use_flags(args):
+    """Manage USE flags - global or per-package"""
+    if not args:
+        print("Usage: evp use [package] <flags>")
+        print("Examples:")
+        print("  evp use +kde -gnome           # Global USE flags")
+        print("  evp use firefox -wayland      # Per-package USE")
+        return 1
+    
+    # Check if first arg is a package name or a USE flag
+    if args[0].startswith('+') or args[0].startswith('-'):
+        # Global USE flags
+        flags = ' '.join(args)
+        print(f"→ Adding global USE flags: {flags}")
+        
+        if DRY_RUN:
+            print(f"  Would add to {MAKE_CONF}: USE=\"{flags}\"")
+            return 0
+        
+        # Read current USE flags from make.conf
+        use_line = f'USE="${flags}"\n'
+        
+        # TODO: Better make.conf parsing - for now just append
+        print(f"⚠ Appending to {MAKE_CONF}")
+        print(f"  You may want to manually merge this with existing USE=\"...\" line")
+        append_to_file(MAKE_CONF, use_line)
+        
+    else:
+        # Per-package USE flags
+        package = args[0]
+        flags = ' '.join(args[1:])
+        
+        if not flags:
+            print(f"Usage: evp use {package} <flags>")
+            return 1
+        
+        print(f"→ Setting USE flags for {package}: {flags}")
+        entry = f"{package} {flags}"
+        
+        if DRY_RUN:
+            print(f"  Would add to {PACKAGE_USE}: {entry}")
+            return 0
+        
+        append_to_file(PACKAGE_USE, entry)
+    
+    print("✓ Done! Run 'evp upgrade' to apply changes")
+    return 0
+
+
+def use_remove(args):
+    """Remove USE flags"""
+    if not args:
+        print("Usage: evp use-remove <package> [flags]")
+        return 1
+    
+    package = args[0]
+    print(f"→ Removing USE flags for {package}")
+    
+    if DRY_RUN:
+        print(f"  Would remove from {PACKAGE_USE}: {package}")
+        return 0
+    
+    remove_from_file(PACKAGE_USE, package)
+    print("✓ Done!")
+    return 0
+
+
+def use_show(args):
+    """Show USE flags"""
+    if not args:
+        # Show global USE flags
+        print("→ Global USE flags:")
+        subprocess.call(["portageq", "envvar", "USE"])
+    else:
+        # Show package-specific USE flags
+        package = args[0]
+        print(f"→ USE flags for {package}:")
+        subprocess.call(["emerge", "-pv", package])
+    return 0
+
+
+# ============================================================================
+# Repository management
+# ============================================================================
+def repo_add(repos):
+    """Add repositories (overlays)"""
+    if not repos:
+        print("Usage: evp repo-add <repo> [repo...]")
+        return 1
+    
+    for repo in repos:
+        print(f"→ Enabling repository: {repo}")
+        ret = run_command(["eselect", "repository", "enable", repo], explain=True)
+        if ret != 0:
+            print(f"✗ Failed to enable {repo}")
+            return ret
+    
+    print("\n→ Syncing new repositories...")
+    return run_command(["emerge", "--sync"], spinner_msg="Syncing repos")
+
+
+def repo_remove(repos):
+    """Remove repositories"""
+    if not repos:
+        print("Usage: evp repo-remove <repo> [repo...]")
+        return 1
+    
+    for repo in repos:
+        print(f"→ Disabling repository: {repo}")
+        ret = run_command(["eselect", "repository", "disable", repo], explain=True)
+        if ret != 0:
+            print(f"✗ Failed to disable {repo}")
+    
+    return 0
+
+
+def repo_list():
+    """List repositories"""
+    print("→ Available repositories:")
+    return subprocess.call(["eselect", "repository", "list"])
+
+
+# ============================================================================
+# Keyword management (unstable packages)
+# ============================================================================
+def keyword_add(packages):
+    """Accept unstable keywords for packages"""
+    if not packages:
+        print("Usage: evp keyword <package> [package...]")
+        return 1
+    
+    # Get system arch
+    arch = subprocess.check_output(["portageq", "envvar", "ARCH"]).decode().strip()
+    keyword = f"~{arch}"
+    
+    for package in packages:
+        print(f"→ Accepting {keyword} for {package}")
+        entry = f"{package} {keyword}"
+        
+        if DRY_RUN:
+            print(f"  Would add to {PACKAGE_KEYWORDS}: {entry}")
+        else:
+            append_to_file(PACKAGE_KEYWORDS, entry)
+    
+    print("✓ Done!")
+    return 0
+
+
+def keyword_remove(packages):
+    """Remove keyword acceptance for packages"""
+    if not packages:
+        print("Usage: evp keyword-remove <package> [package...]")
+        return 1
+    
+    for package in packages:
+        print(f"→ Removing keyword acceptance for {package}")
+        
+        if DRY_RUN:
+            print(f"  Would remove from {PACKAGE_KEYWORDS}: {package}")
+        else:
+            remove_from_file(PACKAGE_KEYWORDS, package)
+    
+    print("✓ Done!")
+    return 0
+
+
+# ============================================================================
+# License management
+# ============================================================================
+def license_add(args):
+    """Accept licenses globally or per-package"""
+    if not args:
+        print("Usage: evp license <license>")
+        print("   or: evp license <package> <license>")
+        print("Examples:")
+        print("  evp license @BINARY-REDISTRIBUTABLE")
+        print("  evp license firefox @BINARY-REDISTRIBUTABLE")
+        return 1
+    
+    if len(args) == 1:
+        # Global license
+        license_name = args[0]
+        print(f"→ Accepting license globally: {license_name}")
+        
+        if DRY_RUN:
+            print(f"  Would add to {MAKE_CONF}: ACCEPT_LICENSE=\"{license_name}\"")
+            return 0
+        
+        append_to_file(MAKE_CONF, f'ACCEPT_LICENSE="{license_name}"')
+    else:
+        # Per-package license
+        package = args[0]
+        license_name = ' '.join(args[1:])
+        print(f"→ Accepting license for {package}: {license_name}")
+        entry = f"{package} {license_name}"
+        
+        if DRY_RUN:
+            print(f"  Would add to {PACKAGE_LICENSE}: {entry}")
+            return 0
+        
+        append_to_file(PACKAGE_LICENSE, entry)
+    
+    print("✓ Done!")
+    return 0
+
+
+# ============================================================================
+# Build log viewer
+# ============================================================================
+def show_logs(args):
+    """Show build logs"""
+    if args and args[0] == "--failed":
+        print("→ Recent failed builds:")
+        # Find recent failed build logs
+        result = subprocess.run(
+            ["find", BUILD_LOG_DIR, "-name", "*.log", "-type", "f", "-mtime", "-7"],
+            capture_output=True,
+            text=True
+        )
+        
+        if result.stdout:
+            logs = result.stdout.strip().split('\n')
+            for log in logs[:10]:  # Show last 10
+                print(f"  {log}")
+        else:
+            print("  No recent logs found")
+        return 0
+    
+    elif args:
+        package = args[0]
+        print(f"→ Looking for build log for {package}...")
+        
+        # Find most recent log for package
+        result = subprocess.run(
+            ["find", BUILD_LOG_DIR, "-name", f"*{package}*.log", "-type", "f"],
+            capture_output=True,
+            text=True
+        )
+        
+        if result.stdout:
+            logs = result.stdout.strip().split('\n')
+            latest = max(logs, key=os.path.getmtime)
+            print(f"→ Showing: {latest}\n")
+            subprocess.call(["less", latest])
+        else:
+            print(f"✗ No build log found for {package}")
+        return 0
+    
+    else:
+        print("Usage: evp logs <package>")
+        print("   or: evp logs --failed")
+        return 1
+
+
+# ============================================================================
+# Configuration file updates
+# ============================================================================
+def config_update():
+    """Update configuration files (etc-update wrapper)"""
+    print("→ Checking for configuration updates...")
+    
+    # Check if there are any updates needed
+    result = subprocess.run(
+        ["find", "/etc", "-name", "._cfg????_*"],
+        capture_output=True,
+        text=True
+    )
+    
+    if not result.stdout:
+        print("✓ No configuration updates needed!")
+        return 0
+    
+    print("→ Configuration files need updating")
+    print("  Launching etc-update...")
+    return subprocess.call(["etc-update"])
+
+
+# ============================================================================
+# Help
+# ============================================================================
+def show_help():
+    """Show help message"""
+    help_text = """
+evp - EVIL pAnager (the emerge wrapper that makes sense)
+
+Usage: evp [--dry-run] <command> [options] [packages...]
+
+Package Management:
+  install <pkg>...           Install packages
+  remove <pkg>...            Remove packages (safe: deselect + depclean)
+  remove -f <pkg>...         Force remove (--unmerge, ignores deps)
+  update                     Update repository metadata (--sync)
+  upgrade                    Upgrade installed packages (-uDN @world)
+  search <term>              Search for packages
+  list                       List installed packages
+  info <pkg>                 Show package information
+
+USE Flags:
+  use <flags>                Set global USE flags (e.g., +kde -gnome)
+  use <pkg> <flags>          Set per-package USE flags
+  use-remove <pkg>           Remove USE flags for package
+  use-show [pkg]             Show USE flags (global or per-package)
+
+Repositories (Overlays):
+  repo-add <repo>...         Enable repository (e.g., guru)
+  repo-remove <repo>...      Disable repository
+  repo-list                  List available repositories
+
+Keywords (Unstable Packages):
+  keyword <pkg>...           Accept unstable keywords (~arch)
+  keyword-remove <pkg>...    Remove keyword acceptance
+
+Licenses:
+  license <license>          Accept license globally
+  license <pkg> <license>    Accept license for package
+
+Maintenance:
+  logs <pkg>                 Show build log for package
+  logs --failed              Show recent failed builds
+  config-update              Update configuration files (etc-update)
+
+Options:
+  --dry-run                  Show what would be done without doing it
+
+Examples:
+  evp install firefox
+  evp use firefox -wayland +pulseaudio
+  evp repo-add guru
+  evp keyword neovim
+  evp license @BINARY-REDISTRIBUTABLE
+  evp --dry-run upgrade
+
+Spinners: Edit SPINNERS dict at the top of this script!
+Current spinner: {ACTIVE_SPINNER}
+"""
+    print(help_text)
+    return 0
+
+
+# ============================================================================
+# Main
+# ============================================================================
+def main():
+    global DRY_RUN
+    
+    if len(sys.argv) < 2:
+        show_help()
+        return 1
+    
+    # Check for --dry-run flag
+    args = sys.argv[1:]
+    if "--dry-run" in args:
+        DRY_RUN = True
+        args.remove("--dry-run")
+        print("🔍 DRY RUN MODE - no changes will be made\n")
+    
+    if not args:
+        show_help()
+        return 1
+    
+    command = args[0]
+    rest = args[1:]
+    
+    # Check if running as root for operations that need it
+    needs_root = ["install", "remove", "update", "upgrade", "use", "use-remove", 
+                  "repo-add", "repo-remove", "keyword", "keyword-remove", 
+                  "license", "config-update"]
+    
+    if command in needs_root and os.geteuid() != 0 and not DRY_RUN:
+        print(f"⚠ '{command}' typically needs root privileges")
+        print(f"  Try: sudo evp {' '.join(args)}")
+        print(f"  Or: evp --dry-run {' '.join(args)} (to preview)")
+    
+    # Route commands
+    if command == "install":
+        return install(rest)
+    elif command == "remove":
+        force = False
+        packages = rest
+        if packages and packages[0] in ["-f", "--force"]:
+            force = True
+            packages = packages[1:]
+        return remove(packages, force)
+    elif command == "update":
+        return update()
+    elif command == "upgrade":
+        return upgrade()
+    elif command == "search":
+        return search(rest)
+    elif command == "list":
+        return list_installed()
+    elif command == "info":
+        return info(rest)
+    
+    # USE flags
+    elif command == "use":
+        return use_flags(rest)
+    elif command == "use-remove":
+        return use_remove(rest)
+    elif command == "use-show":
+        return use_show(rest)
+    
+    # Repositories
+    elif command == "repo-add":
+        return repo_add(rest)
+    elif command == "repo-remove":
+        return repo_remove(rest)
+    elif command == "repo-list":
+        return repo_list()
+    
+    # Keywords
+    elif command == "keyword":
+        return keyword_add(rest)
+    elif command == "keyword-remove":
+        return keyword_remove(rest)
+    
+    # Licenses
+    elif command == "license":
+        return license_add(rest)
+    
+    # Maintenance
+    elif command == "logs":
+        return show_logs(rest)
+    elif command == "config-update":
+        return config_update()
+    
+    # Help
+    elif command in ["help", "--help", "-h"]:
+        return show_help()
+    
+    else:
+        print(f"Unknown command: {command}")
+        print("Run 'evp help' for usage")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
